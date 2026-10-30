@@ -996,6 +996,7 @@ fn print_primary_response(resp: &Response, action: Option<&str>, opts: &OutputOp
                 let label = match action {
                     Some("cookies_clear") => "Cookies cleared",
                     Some("console") => "Console log cleared",
+                    Some("errors") => "Page errors cleared",
                     _ => "Request log cleared",
                 };
                 println!("{} {}", color::success_indicator(), label);
@@ -1719,6 +1720,8 @@ Global Options:
   --allowed-domains <list>  Restrict read fetches and redirects to allowed domains
   --content-boundaries Wrap read output in boundary markers
   --max-output <chars> Truncate read output to N chars
+  Invalid --max-output and AGENT_BROWSER_MAX_OUTPUT values warn and leave the
+  existing output limit unchanged.
 
 Examples:
   agent-browser read
@@ -2631,10 +2634,13 @@ Cookie Set Options:
   --url <url>                        URL for the cookie (allows setting before page load)
   --domain <domain>                  Cookie domain (e.g., ".example.com")
   --path <path>                      Cookie path (e.g., "/api")
-  --httpOnly                         Set HttpOnly flag (prevents JavaScript access)
+  --http-only                        Set HttpOnly flag (prevents JavaScript access)
   --secure                           Set Secure flag (HTTPS only)
-  --sameSite <Strict|Lax|None>       SameSite policy
+  --same-site <Strict|Lax|None>      SameSite policy
   --expires <timestamp>              Expiration time (Unix timestamp in seconds)
+
+The legacy camelCase spellings --httpOnly and --sameSite are still accepted.
+When setting one cookie, unknown flags and extra arguments return an error.
 
 Note: If --url, --domain, and --path are all omitted, the cookie will be set
 for the current page URL.
@@ -2650,11 +2656,11 @@ Examples:
   # Set cookie for a URL before loading it (useful for authentication)
   agent-browser cookies set session_id "abc123" --url https://app.example.com
 
-  # Set secure, httpOnly cookie with domain and path
-  agent-browser cookies set auth_token "xyz789" --domain example.com --path /api --httpOnly --secure
+  # Set secure, HttpOnly cookie with domain and path
+  agent-browser cookies set auth_token "xyz789" --domain example.com --path /api --http-only --secure
 
   # Set cookie with SameSite policy
-  agent-browser cookies set tracking_consent "yes" --sameSite Strict
+  agent-browser cookies set tracking_consent "yes" --same-site Strict
 
   # Set cookie with expiration (Unix timestamp)
   agent-browser cookies set temp_token "temp123" --expires 1735689600
@@ -3808,6 +3814,9 @@ Capabilities:
 Core capabilities and protocol request types use dedicated command paths.
 Use auth login for credential.read, --provider for browser.provider, and
 a local launch for launch.mutate.
+Credential, browser-provider, and launch-mutation errors omit response error
+text and unsupported protocol values. Manifest discovery and plugin run retain
+detailed errors.
 
 Example config:
   {{
@@ -3917,7 +3926,7 @@ Network:  agent-browser network <action>
   har <start|stop> [path]
 
 Storage:
-  cookies [get|set|clear]    Manage cookies (set supports --url, --domain, --path, --httpOnly, --secure, --sameSite, --expires)
+  cookies [get|set|clear]    Manage cookies (set supports --url, --domain, --path, --http-only, --secure, --same-site, --expires)
                              Or:  cookies set --curl <file> [--domain <host>] (auto-detects JSON/cURL/Cookie-header files)
   storage <local|session>    Manage web storage
 
@@ -4111,12 +4120,14 @@ Options:
   --download-path <path>     Default download directory (or AGENT_BROWSER_DOWNLOAD_PATH)
   --content-boundaries       Wrap page output in boundary markers (or AGENT_BROWSER_CONTENT_BOUNDARIES)
   --max-output <chars>       Truncate page output to N chars (or AGENT_BROWSER_MAX_OUTPUT)
+                             Invalid values warn and leave the existing output limit unchanged.
   --allowed-domains <list>   Restrict network domains; rejects CDP, auto-connect, profiles, restore/state replay, direct-page providers, unsafe startup args, iOS/Safari (or AGENT_BROWSER_ALLOWED_DOMAINS)
   --action-policy <path>     Action policy JSON file (or AGENT_BROWSER_ACTION_POLICY)
   --confirm-actions <list>   Categories requiring confirmation (or AGENT_BROWSER_CONFIRM_ACTIONS)
   --confirm-interactive      Interactive confirmation prompts; auto-denies if stdin is not a TTY (or AGENT_BROWSER_CONFIRM_INTERACTIVE)
   --idle-timeout <time>      Shut down daemon after inactivity: 10s, 3m, 1h, or raw ms
                              (default: 1h; 0 disables; dashboard input resets the timer)
+                             Values too large to convert to milliseconds produce a warning and are ignored
   --engine <name>            Browser engine: chrome (default), lightpanda, obscura (experimental)
                              (or AGENT_BROWSER_ENGINE); Obscura rejects --proxy-bypass,
                              proxyBypass config, AGENT_BROWSER_PROXY_BYPASS, NO_PROXY/no_proxy,
