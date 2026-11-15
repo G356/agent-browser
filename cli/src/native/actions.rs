@@ -23,9 +23,10 @@ use super::browser::{should_track_target, BrowserManager, WaitUntil, WedgeReport
 use super::cdp::chrome::{prepare_nss_home, LaunchOptions};
 use super::cdp::client::{is_session_detached_error, CdpClient};
 use super::cdp::types::{
-    AttachToTargetParams, AttachToTargetResult, CdpEvent, DispatchMouseEventParams,
-    ExceptionThrownEvent, GetFullAXTreeResult, JavascriptDialogOpeningEvent, TargetCreatedEvent,
-    TargetDestroyedEvent, TargetInfo, TargetInfoChangedEvent,
+    session_matches, AttachToTargetParams, AttachToTargetResult, CdpEvent,
+    DispatchMouseEventParams, ExceptionThrownEvent, GetFullAXTreeResult,
+    JavascriptDialogOpeningEvent, TargetCreatedEvent, TargetDestroyedEvent, TargetInfo,
+    TargetInfoChangedEvent,
 };
 use super::cookies;
 use super::diff;
@@ -34,6 +35,7 @@ use super::element::RefMap;
 use super::inspect_server::InspectServer;
 use super::interaction;
 use super::network::{self, DomainFilter, EventTracker};
+use super::pointer::{ClickPlan, ClickSpec, Modifiers, MouseButton};
 use super::policy::{ActionPolicy, ConfirmActions, PolicyResult};
 use super::providers;
 use super::react;
@@ -1899,11 +1901,12 @@ impl DaemonState {
                         _ => {}
                     }
 
-                    let session_matches = if let Some(ref browser) = self.browser {
-                        event.session_id.as_deref() == browser.active_session_id().ok()
-                    } else {
-                        false
-                    };
+                    let session_matches = session_matches(
+                        self.browser
+                            .as_ref()
+                            .and_then(|browser| browser.active_session_id().ok()),
+                        event.session_id.as_deref(),
+                    );
 
                     // Allow Network events from cross-origin iframe sessions
                     // when HAR recording or request tracking is active.
@@ -1938,15 +1941,13 @@ impl DaemonState {
 
                     match event.method.as_str() {
                         "WebMCP.toolsAdded" => {
-                            if let Some(session_id) = event.session_id.as_deref() {
-                                self.webmcp
-                                    .apply_tools_added(session_id, &event.params, "null");
-                            }
+                            let session_id = event.session_id.as_deref().unwrap_or_default();
+                            self.webmcp
+                                .apply_tools_added(session_id, &event.params, "null");
                         }
                         "WebMCP.toolsRemoved" => {
-                            if let Some(session_id) = event.session_id.as_deref() {
-                                self.webmcp.apply_tools_removed(session_id, &event.params);
-                            }
+                            let session_id = event.session_id.as_deref().unwrap_or_default();
+                            self.webmcp.apply_tools_removed(session_id, &event.params);
                         }
                         "WebMCP.toolResponded" => {
                             self.webmcp.apply_response(event.params.clone());
@@ -2635,6 +2636,7 @@ pub(crate) async fn close_current_browser(state: &mut DaemonState) -> Result<(),
     state.active_iframe_sessions.clear();
     state.webmcp.clear_all();
     state.screencasting = false;
+    state.pending_dialog = None;
     state.reset_input_state();
     state.update_stream_client().await;
 
@@ -2968,6 +2970,19 @@ fn append_launch_policy_actions(
 
 /// The command future is large; boxing it keeps it off the caller's stack,
 /// which a debug-build test thread would otherwise overflow.
+/// Fields the CLI adds to every command to carry session configuration. They
+/// are not part of the action, so stream broadcasts and flow recordings drop them.
+pub(crate) const ENVELOPE_KEYS: &[&str] = &[
+    "plugins",
+    "settings",
+    "pinTab",
+    "restoreKey",
+    "restoreSave",
+    "restoreCheckUrl",
+    "restoreCheckText",
+    "restoreCheckFn",
+];
+
 pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     Box::pin(execute_command_flow(cmd, state)).await
 }
@@ -3091,25 +3106,11 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
 
     if let Some(ref server) = state.stream_server {
         let mut broadcast_cmd;
-        let has_internal_fields = cmd.get("plugins").is_some()
-            || cmd.get("settings").is_some()
-            || cmd.get("pinTab").is_some()
-            || cmd.get("restoreKey").is_some()
-            || cmd.get("restoreSave").is_some()
-            || cmd.get("restoreCheckUrl").is_some()
-            || cmd.get("restoreCheckText").is_some()
-            || cmd.get("restoreCheckFn").is_some();
+        let has_internal_fields = ENVELOPE_KEYS.iter().any(|k| cmd.get(k).is_some());
         let cmd_for_broadcast = if has_internal_fields {
             broadcast_cmd = cmd.clone();
             if let Some(obj) = broadcast_cmd.as_object_mut() {
-                obj.remove("plugins");
-                obj.remove("settings");
-                obj.remove("pinTab");
-                obj.remove("restoreKey");
-                obj.remove("restoreSave");
-                obj.remove("restoreCheckUrl");
-                obj.remove("restoreCheckText");
-                obj.remove("restoreCheckFn");
+                obj.retain(|k, _| !ENVELOPE_KEYS.contains(&k.as_str()));
             }
             &broadcast_cmd
         } else {
@@ -3529,8 +3530,8 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         "close" => handle_close(state).await,
         "snapshot" => handle_snapshot(cmd, state).await,
         "screenshot" => handle_screenshot(cmd, state).await,
-        "click" => handle_click(cmd, state).await,
-        "dblclick" => handle_dblclick(cmd, state).await,
+        "click" => handle_click(cmd, state, 1).await,
+        "dblclick" => handle_click(cmd, state, 2).await,
         "fill" => handle_fill(cmd, state).await,
         "type" => handle_type(cmd, state).await,
         "press" => handle_press(cmd, state).await,
@@ -7113,7 +7114,12 @@ fn record_click_animation(
     }
 }
 
-async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+async fn handle_click(
+    cmd: &Value,
+    state: &mut DaemonState,
+    default_count: u8,
+) -> Result<Value, String> {
+    let plan = ClickPlan::from_command(cmd, default_count)?;
     let selector = cmd
         .get("selector")
         .and_then(|v| v.as_str())
@@ -7121,89 +7127,103 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
 
     if let Some(ref wb) = state.webdriver_backend {
         if state.browser.is_none() {
-            wb.click(selector).await?;
-            return Ok(json!({ "clicked": selector }));
+            match plan {
+                ClickPlan::Pointer(spec) if spec.is_plain() => {
+                    wb.click(selector).await?;
+                    return Ok(json!({ "clicked": selector }));
+                }
+                ClickPlan::Pointer(_) => {
+                    return Err(
+                        "The Safari and iOS backends only support a plain left click; --button, --modifiers, and dblclick need a Chrome session"
+                            .to_string(),
+                    )
+                }
+                ClickPlan::NewTab => {
+                    return Err(
+                        "The Safari and iOS backends cannot open a tab from a click; use `tab new <url>`"
+                            .to_string(),
+                    )
+                }
+            }
         }
     }
 
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
 
-    let new_tab = cmd.get("newTab").and_then(|v| v.as_bool()).unwrap_or(false);
-
-    if new_tab {
-        use super::element::resolve_element_object_id;
-        let (object_id, effective_session_id) = resolve_element_object_id(
-            &mgr.client,
-            &session_id,
-            &state.ref_map,
-            selector,
-            &state.iframe_sessions,
-        )
-        .await?;
-        let call_params = json!({
-            "objectId": object_id,
-            "functionDeclaration": "function() { var h = this.getAttribute('href'); if (!h) return null; try { return new URL(h, document.baseURI).toString(); } catch(e) { return null; } }",
-            "returnByValue": true
-        });
-        let call_result = mgr
-            .client
-            .send_command(
-                "Runtime.callFunctionOn",
-                Some(call_params),
-                Some(&effective_session_id),
+    let spec = match plan {
+        ClickPlan::NewTab => {
+            use super::element::resolve_element_object_id;
+            let (object_id, effective_session_id) = resolve_element_object_id(
+                &mgr.client,
+                &session_id,
+                &state.ref_map,
+                selector,
+                &state.iframe_sessions,
             )
             .await?;
-        let href = call_result
-            .get("result")
-            .and_then(|r| r.get("value"))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                format!(
+            let call_params = json!({
+                "objectId": object_id,
+                "functionDeclaration": "function() { var h = this.getAttribute('href'); if (!h) return null; try { return new URL(h, document.baseURI).toString(); } catch(e) { return null; } }",
+                "returnByValue": true
+            });
+            let call_result = mgr
+                .client
+                .send_command(
+                    "Runtime.callFunctionOn",
+                    Some(call_params),
+                    Some(&effective_session_id),
+                )
+                .await?;
+            let href = call_result
+                .get("result")
+                .and_then(|r| r.get("value"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    format!(
                     "Element '{}' does not have an href attribute. --new-tab only works on links.",
                     selector
                 )
-            })?
-            .to_string();
+                })?
+                .to_string();
 
-        let domain_filter = state.domain_filter.read().await.clone();
-        let has_proxy_creds = state.proxy_credentials.read().await.is_some();
-        let defer_url_until_controls = should_defer_url_until_network_controls(
-            domain_filter.as_ref(),
-            has_proxy_creds,
-            Some(&href),
-        )?;
-        // `click --new-tab` creates the same kind of daemon-owned tab as
-        // `tab new`, so it must use the same pre-navigation setup path.
-        let defer_url = defer_url_until_controls || session_setup_pending(state).await;
+            let domain_filter = state.domain_filter.read().await.clone();
+            let has_proxy_creds = state.proxy_credentials.read().await.is_some();
+            let defer_url_until_controls = should_defer_url_until_network_controls(
+                domain_filter.as_ref(),
+                has_proxy_creds,
+                Some(&href),
+            )?;
+            // `click --new-tab` creates the same kind of daemon-owned tab as
+            // `tab new`, so it must use the same pre-navigation setup path.
+            let defer_url = defer_url_until_controls || session_setup_pending(state).await;
 
-        state.ref_map.begin_snapshot();
-        state.active_iframe_sessions.clear();
-        state.active_frame_id = None;
-        state.webmcp.clear_invocations();
-        let new_session_id = {
-            let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
-            mgr.tab_new(if defer_url { None } else { Some(&href) }, None)
-                .await?;
-            mgr.active_session_id()?.to_string()
-        };
+            state.ref_map.begin_snapshot();
+            state.active_iframe_sessions.clear();
+            state.active_frame_id = None;
+            state.webmcp.clear_invocations();
+            let new_session_id = {
+                let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
+                mgr.tab_new(if defer_url { None } else { Some(&href) }, None)
+                    .await?;
+                mgr.active_session_id()?.to_string()
+            };
 
-        apply_session_setup(state, &new_session_id).await?;
-        install_network_controls_or_close(state, has_proxy_creds).await?;
-        state.drain_cdp_events_background().await?;
+            apply_session_setup(state, &new_session_id).await?;
+            install_network_controls_or_close(state, has_proxy_creds).await?;
+            state.drain_cdp_events_background().await?;
 
-        if defer_url {
-            let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
-            mgr.navigate(&href, WaitUntil::Load).await?;
+            if defer_url {
+                let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
+                mgr.navigate(&href, WaitUntil::Load).await?;
+            }
+
+            state.refresh_active_iframe_sessions().await;
+
+            return Ok(json!({ "clicked": selector, "newTab": true, "url": href }));
         }
-
-        state.refresh_active_iframe_sessions().await;
-
-        return Ok(json!({ "clicked": selector, "newTab": true, "url": href }));
-    }
-
-    let button = cmd.get("button").and_then(|v| v.as_str()).unwrap_or("left");
-    let click_count = cmd.get("clickCount").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
+        ClickPlan::Pointer(spec) => spec,
+    };
 
     let input_mode = cmd
         .get("inputMode")
@@ -7248,8 +7268,7 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         &session_id,
         &state.ref_map,
         selector,
-        button,
-        click_count,
+        spec,
         &state.iframe_sessions,
     )
     .await?;
@@ -7259,34 +7278,6 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         &state.recording_state.shared_cursor,
     );
 
-    if result.dialog_opened {
-        state.pending_pointer_release = result.pending_release;
-        return Ok(json!({ "clicked": selector, "dialogOpened": true }));
-    }
-    Ok(json!({ "clicked": selector }))
-}
-
-async fn handle_dblclick(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
-    let selector = cmd
-        .get("selector")
-        .and_then(|v| v.as_str())
-        .ok_or("Missing 'selector' parameter")?;
-
-    let result = interaction::dblclick(
-        &mgr.client,
-        &session_id,
-        &state.ref_map,
-        selector,
-        &state.iframe_sessions,
-    )
-    .await?;
-    record_click_animation(
-        &result,
-        &mut state.mouse_state,
-        &state.recording_state.shared_cursor,
-    );
     if result.dialog_opened {
         state.pending_pointer_release = result.pending_release;
         return Ok(json!({ "clicked": selector, "dialogOpened": true }));
@@ -7383,12 +7374,10 @@ fn parse_key_chord(input: &str) -> (String, Option<i32>) {
     let mut key_parts: Vec<&str> = Vec::new();
 
     for part in &parts {
-        match part.to_lowercase().as_str() {
-            "alt" => modifiers |= 1,
-            "control" | "ctrl" => modifiers |= 2,
-            "meta" | "cmd" | "command" => modifiers |= 4,
-            "shift" => modifiers |= 8,
-            _ => key_parts.push(part),
+        if let Some(bit) = Modifiers::bit(part) {
+            modifiers |= bit;
+        } else {
+            key_parts.push(part);
         }
     }
 
@@ -7778,7 +7767,7 @@ async fn handle_reload(state: &mut DaemonState) -> Result<Value, String> {
             match rx.recv().await {
                 Ok(event) => {
                     if event.method == "Page.loadEventFired"
-                        && event.session_id.as_deref() == Some(&session_id)
+                        && session_matches(Some(&session_id), event.session_id.as_deref())
                     {
                         return;
                     }
@@ -8414,8 +8403,12 @@ async fn handle_mouse(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     state.mouse_state.x = x;
     state.mouse_state.y = y;
     match event_type {
-        "mousePressed" => state.mouse_state.buttons |= mouse_button_mask(button),
-        "mouseReleased" => state.mouse_state.buttons &= !mouse_button_mask(button),
+        "mousePressed" => {
+            state.mouse_state.buttons |= MouseButton::parse(button).map_or(0, MouseButton::mask)
+        }
+        "mouseReleased" => {
+            state.mouse_state.buttons &= !MouseButton::parse(button).map_or(0, MouseButton::mask)
+        }
         _ => {}
     }
     if let Ok(mut cursor) = state.recording_state.shared_cursor.lock() {
@@ -8802,8 +8795,7 @@ async fn download_to_path(cmd: &Value, state: &mut DaemonState) -> Result<Value,
         &session_id,
         &state.ref_map,
         selector,
-        "left",
-        1,
+        ClickSpec::default(),
         &state.iframe_sessions,
     )
     .await?;
@@ -8830,7 +8822,8 @@ async fn download_to_path(cmd: &Value, state: &mut DaemonState) -> Result<Value,
                 // or with a different sessionId than the page session, so we
                 // accept them regardless. Page-domain events are matched by
                 // session to avoid cross-tab confusion.
-                let is_page_session = event.session_id.as_deref() == Some(&session_id);
+                let is_page_session =
+                    session_matches(Some(&session_id), event.session_id.as_deref());
                 let is_download_event = |method: &str, browser_method: &str, page_method: &str| {
                     method == browser_method || (method == page_method && is_page_session)
                 };
@@ -10432,7 +10425,7 @@ async fn collect_webmcp_tools(state: &mut DaemonState) -> Result<Vec<webmcp::Too
         match tokio::time::timeout(remaining, rx.recv()).await {
             Ok(Ok(event))
                 if event.method == "WebMCP.toolsAdded"
-                    && event.session_id.as_deref() == Some(session_id.as_str()) =>
+                    && session_matches(Some(session_id.as_str()), event.session_id.as_deref()) =>
             {
                 state
                     .webmcp
@@ -10440,7 +10433,7 @@ async fn collect_webmcp_tools(state: &mut DaemonState) -> Result<Vec<webmcp::Too
             }
             Ok(Ok(event))
                 if event.method == "WebMCP.toolsRemoved"
-                    && event.session_id.as_deref() == Some(session_id.as_str()) =>
+                    && session_matches(Some(session_id.as_str()), event.session_id.as_deref()) =>
             {
                 state.webmcp.apply_tools_removed(&session_id, &event.params);
             }
@@ -11035,8 +11028,7 @@ async fn execute_subaction(
                 &session_id,
                 &state.ref_map,
                 selector,
-                "left",
-                1,
+                ClickSpec::default(),
                 &state.iframe_sessions,
             )
             .await?;
@@ -11993,7 +11985,7 @@ async fn handle_responsebody(cmd: &Value, state: &DaemonState) -> Result<Value, 
         match tokio::time::timeout(remaining, rx.recv()).await {
             Ok(Ok(event)) => {
                 if event.method == "Network.responseReceived"
-                    && event.session_id.as_deref() == Some(&session_id)
+                    && session_matches(Some(&session_id), event.session_id.as_deref())
                 {
                     if let Some(resp_url) = event
                         .params
@@ -14732,8 +14724,7 @@ async fn handle_auth_login(cmd: &Value, state: &mut DaemonState) -> Result<Value
         &session_id,
         &submit_element.ref_map,
         AUTH_LOGIN_ELEMENT_REF,
-        "left",
-        1,
+        ClickSpec::default(),
         &state.iframe_sessions,
     )
     .await?;
@@ -14754,7 +14745,7 @@ async fn handle_auth_login(cmd: &Value, state: &mut DaemonState) -> Result<Value
         let result = tokio::time::timeout_at(deadline, rx.recv()).await;
         match result {
             Ok(Ok(event)) => {
-                if event.session_id.as_deref() == Some(&session_id) {
+                if session_matches(Some(&session_id), event.session_id.as_deref()) {
                     match event.method.as_str() {
                         "Page.frameNavigated" | "Page.loadEventFired" => {
                             navigated = true;
@@ -14987,33 +14978,6 @@ async fn handle_device_list() -> Result<Value, String> {
 // Input event handlers
 // ---------------------------------------------------------------------------
 
-fn mouse_button_mask(button: &str) -> i32 {
-    match button {
-        "left" => 1,
-        "right" => 2,
-        "middle" => 4,
-        "back" => 8,
-        "forward" => 16,
-        _ => 0,
-    }
-}
-
-fn primary_button_from_mask(buttons: i32) -> &'static str {
-    if buttons & 1 != 0 {
-        "left"
-    } else if buttons & 2 != 0 {
-        "right"
-    } else if buttons & 4 != 0 {
-        "middle"
-    } else if buttons & 8 != 0 {
-        "back"
-    } else if buttons & 16 != 0 {
-        "forward"
-    } else {
-        "none"
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn build_mouse_event_params(
     mouse_state: &mut MouseState,
@@ -15036,10 +15000,12 @@ fn build_mouse_event_params(
     if buttons.is_none() {
         match event_type {
             "mousePressed" => {
-                next_buttons |= mouse_button_mask(button.unwrap_or("left"));
+                next_buttons |=
+                    MouseButton::parse(button.unwrap_or("left")).map_or(0, MouseButton::mask);
             }
             "mouseReleased" => {
-                next_buttons &= !mouse_button_mask(button.unwrap_or("left"));
+                next_buttons &=
+                    !MouseButton::parse(button.unwrap_or("left")).map_or(0, MouseButton::mask);
             }
             _ => {}
         }
@@ -15052,7 +15018,7 @@ fn build_mouse_event_params(
         y,
         button: Some(
             button
-                .unwrap_or(primary_button_from_mask(next_buttons))
+                .unwrap_or(MouseButton::primary(next_buttons).map_or("none", MouseButton::name))
                 .to_string(),
         ),
         buttons: Some(next_buttons),
@@ -16884,6 +16850,126 @@ mod tests {
             "agent-browser-{label}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    #[tokio::test]
+    async fn direct_page_events_reach_debug_and_webmcp_consumers() {
+        use super::native_tracing::{
+            profiler_start, profiler_stop, trace_start, trace_stop, TracingState,
+        };
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut stream_mode = false;
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let cmd: Value = serde_json::from_str(&text).unwrap();
+                let events = match cmd["method"].as_str().unwrap() {
+                    "Runtime.evaluate" if cmd["params"]["expression"].is_string() => vec![
+                        json!({"method":"Page.javascriptDialogOpening", "params":{"url":"https://page.test/", "type":"confirm", "message":"pending"}}),
+                    ],
+                    "Runtime.evaluate" => vec![
+                        json!({"sessionId":"other", "method":"Runtime.consoleAPICalled", "params":{"args":[{"type":"string", "value":"wrong page"}]}}),
+                        json!({"method":"Runtime.consoleAPICalled", "params":{"args":[{"type":"string", "value":"from the page"}]}}),
+                        json!({"method":"Network.requestWillBeSent", "params":{"requestId":"r1", "request":{"url":"https://page.test/"}}}),
+                        json!({"method":"WebMCP.toolsAdded", "params":{"tools":[{"name":"search", "frameId":"frame"}]}}),
+                    ],
+                    "Runtime.releaseObject" => vec![
+                        json!({"method":"WebMCP.toolsRemoved", "params":{"tools":[{"name":"search", "frameId":"frame"}]}}),
+                    ],
+                    "Tracing.start" => {
+                        stream_mode = cmd["params"]["transferMode"] == "ReturnAsStream";
+                        vec![]
+                    }
+                    "Tracing.end" if stream_mode => vec![
+                        json!({"sessionId":"other", "method":"Tracing.tracingComplete", "params":{}}),
+                        json!({"method":"Tracing.tracingComplete", "params":{"stream":"trace"}}),
+                    ],
+                    "Tracing.end" => vec![
+                        json!({"sessionId":"other", "method":"Tracing.tracingComplete", "params":{}}),
+                        json!({"method":"Tracing.dataCollected", "params":{"value":[{"name":"marker"}]}}),
+                        json!({"method":"Tracing.tracingComplete", "params":{}}),
+                    ],
+                    _ => vec![],
+                };
+                let result = if cmd["method"] == "IO.read" {
+                    json!({"data":"{\"traceEvents\":[{\"name\":\"marker\"}]}", "eof":true})
+                } else {
+                    json!({})
+                };
+                let response = json!({"id":cmd["id"], "result":result});
+                for event in events.into_iter().chain([response]) {
+                    ws.send(event.to_string().into()).await.unwrap();
+                }
+            }
+        });
+        let mut state = DaemonState::new();
+        state.browser = Some(BrowserManager::connect_cdp_direct(&url).await.unwrap());
+        let client = state.browser.as_ref().unwrap().client.clone();
+        state.subscribe_to_browser_events();
+        state.har_recording = true;
+        state.request_tracking = true;
+        let (add, remove) = ("Runtime.evaluate", "Runtime.releaseObject");
+        client.send_command_no_params(add, None).await.unwrap();
+        state.drain_cdp_events();
+        assert_eq!(state.event_tracker.console_entries.len(), 1);
+        assert_eq!(state.event_tracker.console_entries[0].text, "from the page");
+        assert_eq!(state.tracked_requests.len(), 1);
+        assert_eq!(state.har_entries.len(), 1);
+        assert_eq!(state.webmcp.tools("").unwrap()[0].name, "search");
+        client.send_command_no_params(remove, None).await.unwrap();
+        state.drain_cdp_events();
+        assert!(state.webmcp.tools("").unwrap().is_empty());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trace.json");
+        let path_str = path.to_str();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let mut trace = TracingState::new();
+            for profile in [false, true] {
+                if profile {
+                    profiler_start(&client, "", &mut trace, None).await.unwrap();
+                    profiler_stop(&client, "", &mut trace, path_str)
+                        .await
+                        .unwrap();
+                } else {
+                    trace_start(&client, "", &mut trace).await.unwrap();
+                    trace_stop(&client, "", &mut trace, path_str).await.unwrap();
+                }
+                let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                assert_eq!(saved["traceEvents"], json!([{"name":"marker"}]));
+            }
+        })
+        .await
+        .unwrap();
+
+        client
+            .send_command(
+                "Runtime.evaluate",
+                Some(json!({"expression":"setTimeout(() => confirm('pending'), 0)"})),
+                None,
+            )
+            .await
+            .unwrap();
+        state.drain_cdp_events();
+        assert_eq!(
+            handle_dialog(&json!({"response":"status"}), &mut state)
+                .await
+                .unwrap(),
+            json!({"hasDialog":true, "type":"confirm", "message":"pending"})
+        );
+        close_current_browser(&mut state).await.unwrap();
+        assert_eq!(
+            handle_dialog(&json!({"response":"status"}), &mut state)
+                .await
+                .unwrap(),
+            json!({"hasDialog":false})
+        );
+        server.abort();
     }
 
     #[test]
